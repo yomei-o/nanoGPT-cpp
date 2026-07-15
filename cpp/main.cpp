@@ -12,6 +12,7 @@
 //                   --heads N --out FILE --eval-every N --seed N
 //                   --init scratch|resume|finetune --ckpt FILE
 //                   --warmup N --min-lr F --decay-iters N --no-lr-decay --grad-clip F
+//                   --grad-accum N  (micro-batches per optimiser step)
 //        resume:   continue training a saved model (params + AdamW state + step)
 //        finetune: keep the saved weights, fresh optimiser/step, train on new data
 //        lr:       cosine decay with linear warmup (nanoGPT get_lr); grad clipped
@@ -226,6 +227,8 @@ static int cmd_train(int argc, char** argv) {
     int decay_iters = arg_i(argc, argv, "--decay-iters", -1); // <0 => final step
     bool lr_decay = !arg_flag(argc, argv, "--no-lr-decay");   // on by default
     double grad_clip = arg_f(argc, argv, "--grad-clip", 1.0); // 0 disables
+    int accum = arg_i(argc, argv, "--grad-accum", 1);         // micro-batches per step
+    if (accum < 1) accum = 1;
     // scratch (default) | resume (continue: params+optimiser+step) |
     // finetune (params only, fresh optimiser + step counter, possibly new data)
     std::string init = arg_s(argc, argv, "--init", "scratch");
@@ -284,6 +287,8 @@ static int cmd_train(int argc, char** argv) {
                     lr, min_lr, warmup, decay_iters, grad_clip);
     else
         std::printf("lr: constant %.2e, grad_clip %.2g\n", lr, grad_clip);
+    if (accum > 1)
+        std::printf("grad accumulation: %d micro-batches -> effective batch %d\n", accum, B * accum);
 
     std::mt19937 rng(seed);
     std::uniform_int_distribution<int> pick(0, (int)train.size() - T - 1);
@@ -303,13 +308,19 @@ static int cmd_train(int argc, char** argv) {
         }
         if (step == steps) break;
 
-        for (int b = 0; b < B; b++) {
-            int off = pick(rng);
-            for (int t = 0; t < T; t++) { inp[b * T + t] = train[off + t]; tgt[b * T + t] = train[off + t + 1]; }
-        }
-        m.forward(inp.data(), tgt.data(), B, T);
+        // gradient accumulation: sum grads over `accum` micro-batches, then one
+        // optimiser step on the average (simulates batch B*accum, as in nanoGPT).
         m.zero_grad();
-        m.backward();
+        for (int micro = 0; micro < accum; micro++) {
+            for (int b = 0; b < B; b++) {
+                int off = pick(rng);
+                for (int t = 0; t < T; t++) { inp[b * T + t] = train[off + t]; tgt[b * T + t] = train[off + t + 1]; }
+            }
+            m.forward(inp.data(), tgt.data(), B, T);
+            m.zero_grad_acts();     // keep param-grad accumulator, reset scratch
+            m.backward();
+        }
+        if (accum > 1) m.scale_grads((real)(1.0 / accum));
         // gradient clipping by global L2 norm (nanoGPT clip_grad_norm_)
         if (grad_clip > 0) {
             double sq = 0;
@@ -391,7 +402,8 @@ int main(int argc, char** argv) {
         "usage:\n"
         "  %s train [input.txt] [--steps N --lr F --batch N --block N --layers N --embd N --heads N --out FILE\n"
         "                        --init scratch|resume|finetune --ckpt FILE\n"
-        "                        --warmup N --min-lr F --decay-iters N --no-lr-decay --grad-clip F]\n"
+        "                        --warmup N --min-lr F --decay-iters N --no-lr-decay --grad-clip F\n"
+        "                        --grad-accum N]\n"
         "  %s sample [ckpt.bin] [--tokens N --temp F --topk N --prompt STR]\n"
         "\n(gradient check: build and run the nanogpt_gradcheck target)\n",
         argv[0], argv[0]);

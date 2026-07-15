@@ -99,7 +99,7 @@ nanogpt sample ckpt.bin --tokens 500 --temp 0.8 --topk 40 --prompt "ROMEO:"
 
 オプション — `train`: `--steps --lr --batch --block --layers --embd --heads --out
 --eval-every --seed --init --ckpt --warmup --min-lr --decay-iters --no-lr-decay
---grad-clip`、`sample`: `--tokens --temp --topk --prompt --seed`。
+--grad-clip --grad-accum`、`sample`: `--tokens --temp --topk --prompt --seed`。
 
 デフォルトでは学習率は **線形ウォームアップ + コサイン減衰**（nanoGPT の `train.py` と同じ
 `get_lr` スケジュール）に従います。`--warmup` ステップ（デフォルト `steps/10`）かけて
@@ -108,6 +108,10 @@ nanogpt sample ckpt.bin --tokens 500 --temp 0.8 --topk 40 --prompt "ROMEO:"
 渡します。勾配はグローバル L2 ノルムが `--grad-clip`（デフォルト `1.0`、`0` で無効）に
 なるようにクリップされます。`resume` 時はスケジュールが復元されたグローバルステップから
 継続するため、ウォームアップは繰り返されません。
+
+`--grad-accum N` は `N` 個のマイクロバッチにわたって勾配を累積してから 1 回の最適化ステップ
+を行います（**実効バッチ `--batch × N`**）。nanoGPT の `gradient_accumulation_steps` に
+相当し、大きなバッチのメモリを使わずに大バッチを模倣します。
 
 短い学習でも明確に学習しているのが分かります（実測、3 層 / embd 96、CPU のみ）:
 

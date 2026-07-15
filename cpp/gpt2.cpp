@@ -12,7 +12,7 @@
 //        new GPT-2 .bin that `gpt2` can generate from.
 //        options: --steps N --lr F --batch N --block N --out FILE --eval-every N
 //                 --warmup N --min-lr F --decay-iters N --no-lr-decay --grad-clip F
-//                 --init finetune|resume --seed N
+//                 --grad-accum N --init finetune|resume --seed N
 // ---------------------------------------------------------------------------
 #include "gpt.h"
 #include "bpe.h"
@@ -239,6 +239,8 @@ static int cmd_finetune(int argc, char** argv) {
     int decay_iters = arg_i(argc, argv, "--decay-iters", -1);   // <0 => final step
     bool lr_decay = !arg_flag(argc, argv, "--no-lr-decay");
     double grad_clip = arg_f(argc, argv, "--grad-clip", 1.0);
+    int accum = arg_i(argc, argv, "--grad-accum", 1);
+    if (accum < 1) accum = 1;
     std::string init = arg_s(argc, argv, "--init", "finetune"); // finetune | resume
 
     GPT m;
@@ -271,6 +273,7 @@ static int cmd_finetune(int argc, char** argv) {
     if (decay_iters < 0) decay_iters = start_iter + steps;
     std::printf("finetune: %s, %d steps, batch %d, block %d, from step %d\n",
                 init.c_str(), steps, B, T, start_iter);
+    if (accum > 1) std::printf("grad accumulation: %d micro-batches -> effective batch %d\n", accum, B * accum);
     if (lr_decay)
         std::printf("lr: cosine %.2e -> %.2e (warmup %d, decay to %d), grad_clip %.2g\n",
                     lr, min_lr, warmup, decay_iters, grad_clip);
@@ -292,13 +295,17 @@ static int cmd_finetune(int argc, char** argv) {
         }
         if (step == steps) break;
 
-        for (int b = 0; b < B; b++) {
-            int off = pick(rng);
-            for (int t = 0; t < T; t++) { inp[b * T + t] = train[off + t]; tgt[b * T + t] = train[off + t + 1]; }
-        }
-        m.forward(inp.data(), tgt.data(), B, T);
         m.zero_grad();
-        m.backward();
+        for (int micro = 0; micro < accum; micro++) {
+            for (int b = 0; b < B; b++) {
+                int off = pick(rng);
+                for (int t = 0; t < T; t++) { inp[b * T + t] = train[off + t]; tgt[b * T + t] = train[off + t + 1]; }
+            }
+            m.forward(inp.data(), tgt.data(), B, T);
+            m.zero_grad_acts();
+            m.backward();
+        }
+        if (accum > 1) m.scale_grads((real)(1.0 / accum));
         if (grad_clip > 0) {
             double sq = 0;
             for (size_t i = 0; i < m.num_params; i++) { double g = m.grads_mem[i]; sq += g * g; }

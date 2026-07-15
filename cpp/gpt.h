@@ -633,6 +633,15 @@ struct GPT {
         std::fill(grads_mem.begin(), grads_mem.end(), (real)0);
         if (!grads_acts_mem.empty()) std::fill(grads_acts_mem.begin(), grads_acts_mem.end(), (real)0);
     }
+    // zero only the activation grads (scratch), keeping the parameter-grad
+    // accumulator intact — used between micro-batches in gradient accumulation.
+    void zero_grad_acts() {
+        if (!grads_acts_mem.empty()) std::fill(grads_acts_mem.begin(), grads_acts_mem.end(), (real)0);
+    }
+    // scale the accumulated parameter grads (e.g. by 1/accum before the step).
+    void scale_grads(real s) {
+        for (size_t i = 0; i < num_params; i++) grads_mem[i] *= s;
+    }
 
     void backward() {
         if (grads_acts_mem.empty()) { grads_acts_mem.assign(num_acts, (real)0); set_act_pointers(grads_acts, grads_acts_mem); }

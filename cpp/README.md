@@ -98,7 +98,7 @@ nanogpt sample ckpt.bin --tokens 500 --temp 0.8 --topk 40 --prompt "ROMEO:"
 
 Options — `train`: `--steps --lr --batch --block --layers --embd --heads --out
 --eval-every --seed --init --ckpt --warmup --min-lr --decay-iters --no-lr-decay
---grad-clip`; `sample`: `--tokens --temp --topk --prompt --seed`.
+--grad-clip --grad-accum`; `sample`: `--tokens --temp --topk --prompt --seed`.
 
 By default the learning rate follows a **cosine decay with linear warmup** (the
 same `get_lr` schedule as nanoGPT's `train.py`): it warms up over `--warmup`
@@ -107,6 +107,11 @@ steps (default `steps/10`), then decays from `--lr` down to `--min-lr` (default
 constant learning rate. Gradients are clipped to a global L2 norm of `--grad-clip`
 (default `1.0`; set `0` to disable). On `resume` the schedule continues at the
 restored global step, so warmup isn't repeated.
+
+`--grad-accum N` accumulates gradients over `N` micro-batches before each
+optimiser step (**effective batch `--batch × N`**), matching nanoGPT's
+`gradient_accumulation_steps` — a way to simulate a larger batch without the
+memory of one.
 
 ### Resume or fine-tune a char model
 

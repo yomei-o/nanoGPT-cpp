@@ -11,6 +11,10 @@ real pretrained GPT-2 weights**.
 Ports [`model.py`](../model.py) (the network) and the training/sampling logic of
 [`train.py`](../train.py) / [`sample.py`](../sample.py) to C++.
 
+> **Companion project:** nanoGPT's successor, nanochat, has a matching
+> dependency-free C++ port at [nanochat-cpp](https://github.com/yomei-o/nanochat-cpp)
+> (modern transformer: RoPE, GQA, Muon, BPE, plus SFT + a chat CLI).
+
 ## Do we need a transformer C++ library? No.
 
 A transformer is "just matmuls plus a few elementwise ops": token/position

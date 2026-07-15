@@ -1,7 +1,12 @@
+[English](README.md) | [日本語](README.ja.md)
 
 # nanoGPT
 
 ![nanoGPT](assets/nanogpt.jpg)
+
+> **C++ 移植版について** — このリポジトリには依存ライブラリなしの C++17 移植版
+> ([`cpp/`](cpp/)) が含まれます。詳しくは [`cpp/README.md`](cpp/README.md)
+> （[日本語](cpp/README.ja.md)）を参照してください。
 
 
 ---

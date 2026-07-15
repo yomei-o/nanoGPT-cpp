@@ -1,3 +1,5 @@
+[English](README.md) | [日本語](README.ja.md)
+
 # nanoGPT — C++ port
 
 A dependency-free **standard C++17** port of Andrej Karpathy's
@@ -95,7 +97,33 @@ nanogpt sample ckpt.bin --tokens 500 --temp 0.8 --topk 40 --prompt "ROMEO:"
 ```
 
 Options — `train`: `--steps --lr --batch --block --layers --embd --heads --out
---eval-every --seed`; `sample`: `--tokens --temp --topk --prompt --seed`.
+--eval-every --seed --init --ckpt`; `sample`: `--tokens --temp --topk --prompt
+--seed`.
+
+### Resume or fine-tune a char model
+
+`train` can continue from a saved checkpoint instead of starting from scratch,
+via `--init` and `--ckpt`:
+
+```bash
+# resume: pick up an interrupted run. Restores weights, AdamW momentum AND the
+# step counter, so training continues exactly where it left off.
+nanogpt train input.txt --init resume --ckpt ckpt.bin --steps 2000 --out ckpt.bin
+
+# finetune: keep the trained weights, but start a fresh optimiser + step counter,
+# and (typically) train on a different text file with a smaller learning rate.
+nanogpt train other.txt --init finetune --ckpt ckpt.bin --steps 500 --lr 3e-4 --out ft.bin
+```
+
+- `--init scratch` (default) — random init, as before.
+- `--init resume` — load params **and** AdamW state (`m`, `v`, step) and continue.
+- `--init finetune` — load params only; the optimiser and step counter reset to 0.
+
+The checkpoint format is now **v2** (params + AdamW moments + step count); old
+**v1** checkpoints (params only) still load. Fine-tuning reuses the checkpoint's
+own character vocabulary — any character in the new text that wasn't in the
+original vocab is skipped on encode, so fine-tune on text from the same domain
+(e.g. more English) for best results.
 
 A short run already shows clear learning (measured here, 3 layers / 96 embd,
 CPU only):
@@ -145,6 +173,38 @@ is portability, not speed. GPT-2 124M generates ~2 tokens/s on 4 CPU threads.
 
 ---
 
+## C. Load a model trained by Python nanoGPT (weight-compatible)
+
+You can load a checkpoint produced by nanoGPT's own `train.py` (e.g. the
+shakespeare_char model) and run it in the C++ port. nanoGPT stores `nn.Linear`
+weights as `[out, in]` (no Conv1D transpose needed), and this port uses the same
+exact-erf GELU as nanoGPT's `nn.GELU()`, so the C++ logits match PyTorch to
+floating-point rounding.
+
+```bash
+# after training in Python nanoGPT (writes out/ckpt.pt and data/.../meta.pkl):
+python export_nanogpt.py out/ckpt.pt data/shakespeare_char/meta.pkl model.bin
+nanogpt sample model.bin --prompt "ROMEO:" --tokens 500 --temp 0.8 --topk 40
+```
+
+**Verified numerically** with `verify_nanogpt_compat.py`, which builds a nanoGPT
+model via the repo's `model.py`, exports it, and compares logits on the same
+input:
+
+```
+PyTorch vs C++ logits (16 positions x 65 vocab):
+  max abs diff  = 2.384e-07
+  argmax agreement = 100.0%
+  -> PASS (weight-compatible)
+```
+
+So greedy generation is identical, and sampled generation is functionally
+identical (only the RNG differs). Note: bit-exactness with PyTorch is not
+attempted (different kernels/summation order); ~1e-7 agreement is the practical
+limit. For the tightest match, build without `-ffast-math`.
+
+---
+
 ## Verification (all run on this machine)
 
 | Check | How | Result |
@@ -153,6 +213,7 @@ is portability, not speed. GPT-2 124M generates ~2 tokens/s on 4 CPU threads.
 | BPE tokenizer | `bpe_test` vs known GPT-2 token ids | **PASS** (exact ids + perfect round-trip) |
 | End-to-end training | `nanogpt train` on tiny-shakespeare | loss 4.20 → 2.38, learns English text |
 | Real GPT-2 124M inference | `gpt2` on exported OpenAI weights | **works** — generates coherent English (see example above) |
+| Weight-compat vs Python nanoGPT | `verify_nanogpt_compat.py` (logits vs PyTorch) | **PASS**, max abs diff 2.4e-7, argmax 100% |
 
 Coherent GPT-2 output is strong evidence the 124M weights load in the correct
 layout and the forward pass is right (any layout error produces garbage).

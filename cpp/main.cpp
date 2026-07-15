@@ -10,6 +10,9 @@
 //
 //  Options (train): --steps N --lr F --batch N --block N --layers N --embd N
 //                   --heads N --out FILE --eval-every N --seed N
+//                   --init scratch|resume|finetune --ckpt FILE
+//        resume:   continue training a saved model (params + AdamW state + step)
+//        finetune: keep the saved weights, fresh optimiser/step, train on new data
 //  Options (sample): --tokens N --temp F --topk N --prompt STR --seed N
 // ---------------------------------------------------------------------------
 #include "gpt.h"
@@ -28,12 +31,16 @@
 using namespace gpt;
 
 // ---- checkpoint I/O (params always stored as float32 for portability) -----
+//  v1 = magic + ver + hdr[6] + vocab + np + params
+//  v2 = v1 layout, then: adam_t(int32) iter(int32) m_mem(f32*np) v_mem(f32*np)
+//       so training can resume with AdamW momentum + step count intact.
 static const char CKPT_MAGIC[4] = {'G', 'P', 'T', 'c'};
 
-static bool save_checkpoint(const std::string& path, const GPT& m, const CharTokenizer& tok) {
+static bool save_checkpoint(const std::string& path, const GPT& m, const CharTokenizer& tok,
+                            int32_t iter = 0) {
     std::ofstream f(path, std::ios::binary);
     if (!f) return false;
-    int32_t ver = 1, hdr[6] = {m.config.block_size, m.config.vocab_size, m.config.n_layer,
+    int32_t ver = 2, hdr[6] = {m.config.block_size, m.config.vocab_size, m.config.n_layer,
                                m.config.n_head, m.config.n_embd, m.config.bias ? 1 : 0};
     f.write(CKPT_MAGIC, 4);
     f.write((char*)&ver, 4);
@@ -47,10 +54,27 @@ static bool save_checkpoint(const std::string& path, const GPT& m, const CharTok
     std::vector<float> buf(m.num_params);
     for (size_t i = 0; i < m.num_params; i++) buf[i] = (float)m.params_mem[i];
     f.write((char*)buf.data(), (std::streamsize)(buf.size() * sizeof(float)));
+    // v2: AdamW state + step. If the optimiser never ran, write zeros.
+    int32_t adam_t = m.adam_t;
+    f.write((char*)&adam_t, 4);
+    f.write((char*)&iter, 4);
+    if (m.m_mem.size() == m.num_params && m.v_mem.size() == m.num_params) {
+        for (size_t i = 0; i < m.num_params; i++) buf[i] = (float)m.m_mem[i];
+        f.write((char*)buf.data(), (std::streamsize)(buf.size() * sizeof(float)));
+        for (size_t i = 0; i < m.num_params; i++) buf[i] = (float)m.v_mem[i];
+        f.write((char*)buf.data(), (std::streamsize)(buf.size() * sizeof(float)));
+    } else {
+        std::vector<float> zero(m.num_params, 0.0f);
+        f.write((char*)zero.data(), (std::streamsize)(zero.size() * sizeof(float)));
+        f.write((char*)zero.data(), (std::streamsize)(zero.size() * sizeof(float)));
+    }
     return (bool)f;
 }
 
-static bool load_checkpoint(const std::string& path, GPT& m, CharTokenizer& tok) {
+// Loads params (all versions). If out_iter != nullptr and the file is v2, also
+// restores AdamW momentum into the model and returns the saved step via *out_iter.
+static bool load_checkpoint(const std::string& path, GPT& m, CharTokenizer& tok,
+                            int32_t* out_iter = nullptr) {
     std::ifstream f(path, std::ios::binary);
     if (!f) { std::fprintf(stderr, "cannot open %s\n", path.c_str()); return false; }
     char magic[4]; int32_t ver, hdr[6];
@@ -68,6 +92,20 @@ static bool load_checkpoint(const std::string& path, GPT& m, CharTokenizer& tok)
     std::vector<float> buf(m.num_params);
     f.read((char*)buf.data(), (std::streamsize)(buf.size() * sizeof(float)));
     for (size_t i = 0; i < m.num_params; i++) m.params_mem[i] = (real)buf[i];
+    if (out_iter) *out_iter = 0;
+    if (ver >= 2) {
+        int32_t adam_t = 0, iter = 0;
+        f.read((char*)&adam_t, 4);
+        f.read((char*)&iter, 4);
+        m.m_mem.assign(m.num_params, (real)0);
+        m.v_mem.assign(m.num_params, (real)0);
+        f.read((char*)buf.data(), (std::streamsize)(buf.size() * sizeof(float)));
+        for (size_t i = 0; i < m.num_params; i++) m.m_mem[i] = (real)buf[i];
+        f.read((char*)buf.data(), (std::streamsize)(buf.size() * sizeof(float)));
+        for (size_t i = 0; i < m.num_params; i++) m.v_mem[i] = (real)buf[i];
+        m.adam_t = adam_t;
+        if (out_iter) *out_iter = iter;
+    }
     return (bool)f;
 }
 
@@ -142,25 +180,54 @@ static int cmd_train(int argc, char** argv) {
     int eval_every = arg_i(argc, argv, "--eval-every", 250);
     uint32_t seed = (uint32_t)arg_i(argc, argv, "--seed", 1337);
     std::string out = arg_s(argc, argv, "--out", "ckpt.bin");
+    // scratch (default) | resume (continue: params+optimiser+step) |
+    // finetune (params only, fresh optimiser + step counter, possibly new data)
+    std::string init = arg_s(argc, argv, "--init", "scratch");
+    std::string ckpt = arg_s(argc, argv, "--ckpt", "");
+    bool is_resume = (init == "resume");
+    bool is_finetune = (init == "finetune");
+    if ((is_resume || is_finetune) && ckpt.empty()) {
+        std::fprintf(stderr, "--init %s requires --ckpt FILE\n", init.c_str()); return 2;
+    }
+    if (init != "scratch" && !is_resume && !is_finetune) {
+        std::fprintf(stderr, "--init must be scratch, resume or finetune\n"); return 2;
+    }
 
     std::ifstream f(input, std::ios::binary);
     if (!f) { std::fprintf(stderr, "cannot open %s (run: get the tiny shakespeare input.txt)\n", input.c_str()); return 1; }
     std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     std::printf("dataset: %zu characters\n", text.size());
 
-    CharTokenizer tok; tok.build_from_text(text);
+    GPT m;
+    CharTokenizer tok;
+    int32_t start_iter = 0;
+    if (is_resume || is_finetune) {
+        // reuse the checkpoint's vocab (baked in); encode() drops unseen chars.
+        if (!load_checkpoint(ckpt, m, tok, &start_iter)) return 1;
+        std::printf("%s from %s: vocab %d, model %.2fM params, saved step %d\n",
+                    init.c_str(), ckpt.c_str(), tok.vocab_size(), m.num_params / 1e6, start_iter);
+        // block_size may be overridden per-run only if it fits the trained model.
+        if (T > m.config.block_size) {
+            std::printf("  (requested --block %d > model block %d; clamping to %d)\n",
+                        T, m.config.block_size, m.config.block_size);
+            T = m.config.block_size;
+        }
+        if (is_finetune) { m.m_mem.clear(); m.v_mem.clear(); m.adam_t = 0; start_iter = 0; }
+    } else {
+        tok.build_from_text(text);
+        GPTConfig c;
+        c.block_size = T; c.vocab_size = tok.vocab_size();
+        c.n_layer = n_layer; c.n_head = n_head; c.n_embd = n_embd; c.bias = false;
+        m.build(c); m.init_random(seed);
+        std::printf("scratch model: %d layers, %d embd, %d heads, block %d  (%.2fM params)\n",
+                    n_layer, n_embd, n_head, T, m.num_params / 1e6);
+    }
     std::printf("vocab size: %d\n", tok.vocab_size());
     std::vector<int> data = tok.encode(text);
+    if ((int)data.size() < T + 2) { std::fprintf(stderr, "dataset too small for block %d\n", T); return 1; }
     size_t n = data.size();
     std::vector<int> train(data.begin(), data.begin() + (size_t)(n * 0.9));
     std::vector<int> val(data.begin() + (size_t)(n * 0.9), data.end());
-
-    GPTConfig c;
-    c.block_size = T; c.vocab_size = tok.vocab_size();
-    c.n_layer = n_layer; c.n_head = n_head; c.n_embd = n_embd; c.bias = false;
-    GPT m; m.build(c); m.init_random(seed);
-    std::printf("model: %d layers, %d embd, %d heads, block %d  (%.2fM params)\n",
-                n_layer, n_embd, n_head, T, m.num_params / 1e6);
 
     std::mt19937 rng(seed);
     std::uniform_int_distribution<int> pick(0, (int)train.size() - T - 1);
@@ -174,7 +241,8 @@ static int cmd_train(int argc, char** argv) {
             real vl = estimate_loss(m, val, B, T, 20, er);
             auto t1 = std::chrono::steady_clock::now();
             double secs = std::chrono::duration<double>(t1 - t0).count();
-            std::printf("step %5d | train loss %.4f | val loss %.4f | %.1fs\n", step, tl, vl, secs);
+            std::printf("step %5d | train loss %.4f | val loss %.4f | %.1fs\n",
+                        start_iter + step, tl, vl, secs);
             std::fflush(stdout);
         }
         if (step == steps) break;
@@ -189,7 +257,8 @@ static int cmd_train(int argc, char** argv) {
         m.adamw((real)lr, (real)0.9, (real)0.99, (real)1e-8, (real)0.1);
     }
 
-    if (save_checkpoint(out, m, tok)) std::printf("saved checkpoint to %s\n", out.c_str());
+    if (save_checkpoint(out, m, tok, start_iter + steps))
+        std::printf("saved checkpoint to %s (step %d)\n", out.c_str(), start_iter + steps);
     else std::fprintf(stderr, "failed to save checkpoint\n");
 
     // a quick sample
@@ -224,13 +293,37 @@ static int cmd_sample(int argc, char** argv) {
     return 0;
 }
 
+// Load a checkpoint, run one forward pass on a token-id file, dump logits.
+// Used to numerically compare against PyTorch (nanoGPT). See verify_nanogpt_compat.py.
+//   nanogpt verify ckpt.bin idx.bin out_logits.bin
+static int cmd_verify(int argc, char** argv) {
+    if (argc < 5) { std::fprintf(stderr, "usage: %s verify ckpt.bin idx.bin out_logits.bin\n", argv[0]); return 2; }
+    GPT m; CharTokenizer tok;
+    if (!load_checkpoint(argv[2], m, tok)) return 1;
+    std::ifstream fi(argv[3], std::ios::binary);
+    if (!fi) { std::fprintf(stderr, "cannot open %s\n", argv[3]); return 1; }
+    int32_t T = 0; fi.read((char*)&T, 4);
+    std::vector<int32_t> ids(T); fi.read((char*)ids.data(), (std::streamsize)T * 4);
+    std::vector<int> idx(ids.begin(), ids.end());
+    m.forward(idx.data(), nullptr, 1, T);
+    int V = m.config.vocab_size;
+    std::vector<float> out((size_t)T * V);
+    for (size_t i = 0; i < out.size(); i++) out[i] = (float)m.acts.logits[i];
+    std::ofstream fo(argv[4], std::ios::binary);
+    fo.write((char*)out.data(), (std::streamsize)(out.size() * sizeof(float)));
+    std::printf("wrote %d x %d logits to %s\n", T, V, argv[4]);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     std::string mode = argc > 1 ? argv[1] : "";
     if (mode == "train")     return cmd_train(argc, argv);
     if (mode == "sample")    return cmd_sample(argc, argv);
+    if (mode == "verify")    return cmd_verify(argc, argv);
     std::fprintf(stderr,
         "usage:\n"
-        "  %s train [input.txt] [--steps N --lr F --batch N --block N --layers N --embd N --heads N --out FILE]\n"
+        "  %s train [input.txt] [--steps N --lr F --batch N --block N --layers N --embd N --heads N --out FILE\n"
+        "                        --init scratch|resume|finetune --ckpt FILE]\n"
         "  %s sample [ckpt.bin] [--tokens N --temp F --topk N --prompt STR]\n"
         "\n(gradient check: build and run the nanogpt_gradcheck target)\n",
         argv[0], argv[0]);

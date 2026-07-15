@@ -179,6 +179,31 @@ way we want to live, to live ...
 CPU では大きなモデルは遅い（KV キャッシュなし、素朴な行列積）です。目的は速度ではなく
 移植性です。GPT-2 124M は 4 スレッド CPU で毎秒約 2 トークン生成します。
 
+### 自分のテキストで GPT-2 をファインチューニングする
+
+`gpt2 finetune` は、本物の GPT-2 重みをプレーンテキストファイル（その場で BPE トークン化）で
+追加学習し、`gpt2` で生成できる新しい `.bin` を書き出します。文字レベル学習器と同じ
+forward+backward・AdamW・コサイン LR スケジュール・勾配クリップを共有します。
+
+```bash
+# 124M を何かのテキストで fine-tune し、その結果から生成する
+gpt2 finetune model_gpt2.bin mytext.txt encoder.json vocab.bpe \
+    --steps 200 --block 256 --batch 1 --lr 3e-5 --out model_ft.bin
+gpt2 model_ft.bin encoder.json vocab.bpe --prompt "Once upon a time"
+```
+
+オプション: `--steps --lr --batch --block --out --eval-every --warmup --min-lr
+--decay-iters --no-lr-decay --grad-clip --init finetune|resume --seed`。保存される
+`.bin` には AdamW の状態も含まれるため、`--init resume` で中断した地点から fine-tune を
+再開できます（通常の `gpt2` 生成は末尾のその状態を無視します）。
+
+速度（このマシン、GPT-2 124M、4 スレッド CPU、`batch 1`）: おおよそ **`--block 128` で
+6 秒/step**、**`--block 256` で約 14 秒/step**。したがって 200 ステップ程度の fine-tune は
+だいたい **20 分**（`block 128`）〜 **45 分**（`block 256`）、1000 ステップなら数時間です。
+CPU のみで未最適化（KV キャッシュなし、素朴な行列積、勾配累積なし）で、高速な学習器では
+なく動作するデモが目的です。より大きなモデル（`gpt2-medium`/`large`/`xl`）は比例して
+遅くなります。
+
 ---
 
 ## C. Python 版 nanoGPT で学習したモデルを読み込む（重み互換）

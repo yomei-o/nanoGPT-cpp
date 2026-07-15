@@ -179,6 +179,32 @@ way we want to live, to live ...
 On CPU this is slow for the larger models (no KV cache, naive matmul); the point
 is portability, not speed. GPT-2 124M generates ~2 tokens/s on 4 CPU threads.
 
+### Fine-tune GPT-2 on your own text
+
+`gpt2 finetune` continues training the real GPT-2 weights on a plain-text file
+(BPE-tokenised on the fly) and writes a new `.bin` that `gpt2` can generate from.
+It shares the same forward+backward, AdamW, cosine LR schedule and gradient
+clipping as the char trainer.
+
+```bash
+# fine-tune 124M on some text, then generate from the result
+gpt2 finetune model_gpt2.bin mytext.txt encoder.json vocab.bpe \
+    --steps 200 --block 256 --batch 1 --lr 3e-5 --out model_ft.bin
+gpt2 model_ft.bin encoder.json vocab.bpe --prompt "Once upon a time"
+```
+
+Options: `--steps --lr --batch --block --out --eval-every --warmup --min-lr
+--decay-iters --no-lr-decay --grad-clip --init finetune|resume --seed`. The saved
+`.bin` also carries the AdamW state, so `--init resume` picks fine-tuning back up
+where it stopped (a plain `gpt2` generate ignores that trailing state).
+
+Speed (this machine, GPT-2 124M, 4 CPU threads, `batch 1`): about **6 s/step at
+`--block 128`** and **~14 s/step at `--block 256`**. So a ~200-step fine-tune is
+roughly **20 min** (`block 128`) to **45 min** (`block 256`); ~1000 steps is a
+few hours. It is CPU-only and un-optimised (no KV cache, naive matmul, no
+gradient accumulation) — meant as a working demo, not a fast trainer. Larger
+models (`gpt2-medium`/`large`/`xl`) are proportionally slower.
+
 ---
 
 ## C. Load a model trained by Python nanoGPT (weight-compatible)

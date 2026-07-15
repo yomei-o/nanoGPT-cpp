@@ -161,19 +161,19 @@ struct BPETokenizer {
                 size_t k = j; while (k < n && !isS((unsigned char)text[k]) && !isL((unsigned char)text[k]) && !isN((unsigned char)text[k])) k++;
                 pieces.push_back(text.substr(start, k - start)); i = k; continue;
             }
-            // whitespace run: keep all but a trailing space that precedes a non-space
+            // whitespace run. GPT-2 attaches a single trailing *space* (0x20) to
+            // the following token as its leading space (the ' ?' in the regex).
             if (isS(c)) {
                 size_t k = i; while (k < n && isS((unsigned char)text[k])) k++;
-                if (k < n && k - i >= 1) { // a following non-space exists; last space attaches to it
-                    if (k - i > 1) pieces.push_back(text.substr(i, k - i - 1));
-                    i = k - 1; // leave one space as lead for next word
-                    // emit that single leading space + next handled in next loop iteration
-                    // but we must ensure progress: handle the single space as its own piece if next is space? no, next is non-space
-                    // fall through: next iteration sees ' ' + word
-                    continue;
-                } else {
-                    pieces.push_back(text.substr(i, k - i)); i = k; continue;
+                if (k < n && k - i > 1 && text[k - 1] == ' ') {
+                    // >1 whitespace before a non-space, ending in a space: peel that
+                    // last space off to lead the next word; emit the rest as a run.
+                    pieces.push_back(text.substr(i, k - i - 1));
+                    i = k - 1; continue;               // i strictly advances (k-1 > i)
                 }
+                // otherwise emit the whole whitespace run (this also covers a lone
+                // '\n'/'\t'/single space, which must advance to avoid looping).
+                pieces.push_back(text.substr(i, k - i)); i = k; continue;
             }
             // fallback
             pieces.push_back(std::string(1, (char)c)); i++;

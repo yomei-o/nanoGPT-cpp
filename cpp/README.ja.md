@@ -98,8 +98,16 @@ nanogpt sample ckpt.bin --tokens 500 --temp 0.8 --topk 40 --prompt "ROMEO:"
 ```
 
 オプション — `train`: `--steps --lr --batch --block --layers --embd --heads --out
---eval-every --seed --init --ckpt`、`sample`: `--tokens --temp --topk --prompt
---seed`。
+--eval-every --seed --init --ckpt --warmup --min-lr --decay-iters --no-lr-decay
+--grad-clip`、`sample`: `--tokens --temp --topk --prompt --seed`。
+
+デフォルトでは学習率は **線形ウォームアップ + コサイン減衰**（nanoGPT の `train.py` と同じ
+`get_lr` スケジュール）に従います。`--warmup` ステップ（デフォルト `steps/10`）かけて
+ウォームアップし、その後 `--lr` から `--min-lr`（デフォルト `lr/10`）まで `--decay-iters`
+（デフォルト: 最終ステップ）で減衰します。学習率を一定にしたい場合は `--no-lr-decay` を
+渡します。勾配はグローバル L2 ノルムが `--grad-clip`（デフォルト `1.0`、`0` で無効）に
+なるようにクリップされます。`resume` 時はスケジュールが復元されたグローバルステップから
+継続するため、ウォームアップは繰り返されません。
 
 短い学習でも明確に学習しているのが分かります（実測、3 層 / embd 96、CPU のみ）:
 

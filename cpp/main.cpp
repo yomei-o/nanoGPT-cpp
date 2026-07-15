@@ -11,8 +11,11 @@
 //  Options (train): --steps N --lr F --batch N --block N --layers N --embd N
 //                   --heads N --out FILE --eval-every N --seed N
 //                   --init scratch|resume|finetune --ckpt FILE
+//                   --warmup N --min-lr F --decay-iters N --no-lr-decay --grad-clip F
 //        resume:   continue training a saved model (params + AdamW state + step)
 //        finetune: keep the saved weights, fresh optimiser/step, train on new data
+//        lr:       cosine decay with linear warmup (nanoGPT get_lr); grad clipped
+//                  by global L2 norm to --grad-clip (0 disables)
 //  Options (sample): --tokens N --temp F --topk N --prompt STR --seed N
 // ---------------------------------------------------------------------------
 #include "gpt.h"
@@ -166,6 +169,21 @@ static std::string arg_s(int argc, char** argv, const char* name, const std::str
     for (int i = 1; i < argc - 1; i++) if (!std::strcmp(argv[i], name)) return argv[i + 1];
     return def;
 }
+static bool arg_flag(int argc, char** argv, const char* name) {
+    for (int i = 1; i < argc; i++) if (!std::strcmp(argv[i], name)) return true;
+    return false;
+}
+
+// Learning-rate schedule: linear warmup then cosine decay to min_lr, matching
+// nanoGPT's get_lr() in train.py. `it` is the (global) step index.
+static double get_lr(int it, double lr, double min_lr, int warmup, int decay_iters) {
+    const double PI = 3.14159265358979323846;
+    if (it < warmup) return lr * (it + 1) / (double)(warmup + 1);   // 1) warmup
+    if (it >= decay_iters) return min_lr;                            // 2) past decay
+    double ratio = (double)(it - warmup) / (double)(decay_iters - warmup);
+    double coeff = 0.5 * (1.0 + std::cos(PI * ratio));               // 3) cosine, 1->0
+    return min_lr + coeff * (lr - min_lr);
+}
 
 // ---- train -----------------------------------------------------------------
 static int cmd_train(int argc, char** argv) {
@@ -180,6 +198,12 @@ static int cmd_train(int argc, char** argv) {
     int eval_every = arg_i(argc, argv, "--eval-every", 250);
     uint32_t seed = (uint32_t)arg_i(argc, argv, "--seed", 1337);
     std::string out = arg_s(argc, argv, "--out", "ckpt.bin");
+    // LR schedule (cosine warmup) + gradient clipping, as in nanoGPT's train.py.
+    double min_lr = arg_f(argc, argv, "--min-lr", -1);       // <0 => lr/10
+    int warmup = arg_i(argc, argv, "--warmup", -1);          // <0 => max(1, steps/10)
+    int decay_iters = arg_i(argc, argv, "--decay-iters", -1); // <0 => final step
+    bool lr_decay = !arg_flag(argc, argv, "--no-lr-decay");   // on by default
+    double grad_clip = arg_f(argc, argv, "--grad-clip", 1.0); // 0 disables
     // scratch (default) | resume (continue: params+optimiser+step) |
     // finetune (params only, fresh optimiser + step counter, possibly new data)
     std::string init = arg_s(argc, argv, "--init", "scratch");
@@ -229,6 +253,16 @@ static int cmd_train(int argc, char** argv) {
     std::vector<int> train(data.begin(), data.begin() + (size_t)(n * 0.9));
     std::vector<int> val(data.begin() + (size_t)(n * 0.9), data.end());
 
+    // resolve schedule defaults now that start_iter and steps are known.
+    if (min_lr < 0) min_lr = lr / 10.0;
+    if (warmup < 0) warmup = std::max(1, steps / 10);
+    if (decay_iters < 0) decay_iters = start_iter + steps;  // decay reaches min_lr at the end
+    if (lr_decay)
+        std::printf("lr: cosine %.2e -> %.2e (warmup %d, decay to step %d), grad_clip %.2g\n",
+                    lr, min_lr, warmup, decay_iters, grad_clip);
+    else
+        std::printf("lr: constant %.2e, grad_clip %.2g\n", lr, grad_clip);
+
     std::mt19937 rng(seed);
     std::uniform_int_distribution<int> pick(0, (int)train.size() - T - 1);
     std::vector<int> inp(B * T), tgt(B * T);
@@ -254,7 +288,18 @@ static int cmd_train(int argc, char** argv) {
         m.forward(inp.data(), tgt.data(), B, T);
         m.zero_grad();
         m.backward();
-        m.adamw((real)lr, (real)0.9, (real)0.99, (real)1e-8, (real)0.1);
+        // gradient clipping by global L2 norm (nanoGPT clip_grad_norm_)
+        if (grad_clip > 0) {
+            double sq = 0;
+            for (size_t i = 0; i < m.num_params; i++) { double g = m.grads_mem[i]; sq += g * g; }
+            double norm = std::sqrt(sq);
+            if (norm > grad_clip) {
+                real scale = (real)(grad_clip / (norm + 1e-6));
+                for (size_t i = 0; i < m.num_params; i++) m.grads_mem[i] *= scale;
+            }
+        }
+        double cur_lr = lr_decay ? get_lr(start_iter + step, lr, min_lr, warmup, decay_iters) : lr;
+        m.adamw((real)cur_lr, (real)0.9, (real)0.99, (real)1e-8, (real)0.1);
     }
 
     if (save_checkpoint(out, m, tok, start_iter + steps))
@@ -323,7 +368,8 @@ int main(int argc, char** argv) {
     std::fprintf(stderr,
         "usage:\n"
         "  %s train [input.txt] [--steps N --lr F --batch N --block N --layers N --embd N --heads N --out FILE\n"
-        "                        --init scratch|resume|finetune --ckpt FILE]\n"
+        "                        --init scratch|resume|finetune --ckpt FILE\n"
+        "                        --warmup N --min-lr F --decay-iters N --no-lr-decay --grad-clip F]\n"
         "  %s sample [ckpt.bin] [--tokens N --temp F --topk N --prompt STR]\n"
         "\n(gradient check: build and run the nanogpt_gradcheck target)\n",
         argv[0], argv[0]);

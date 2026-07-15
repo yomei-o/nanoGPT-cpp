@@ -266,6 +266,10 @@ PyTorch vs C++ logits (16 positions x 65 vocab):
   バイトレベル BPE 自体は厳密です。
 - GELU: `gpt.h` はデフォルトで厳密な `erf` GELU（nanoGPT の `nn.GELU()`）。GPT-2 エクスポートは
   `tanh` 近似（`gelu_new`、GPT-2 が学習に使ったもの）を設定します。
+- dropout は未移植です。nanoGPT の `model.py` には dropout があり（事前学習の既定は `0.0`、
+  `shakespeare_char` 設定は `0.2`）ますが、この移植版は常に dropout `0` で動きます。それ以外の
+  学習仕様はすべて一致します。ここの toy スケールでは差は小さく、融合 attention と活性化バッファ
+  を単純に保つため省略しています。
 - KV キャッシュ: 生成は層ごとに key/value をキャッシュし（`GPT::forward_one`）、新しい
   トークンごとに全文脈を再計算する代わりに O(1) 文脈のステップで済みます（フル
   `forward()` とビット単位一致を検証済み）。文脈ウィンドウ内で有効で、生成が

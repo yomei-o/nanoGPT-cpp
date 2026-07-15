@@ -276,6 +276,11 @@ layout and the forward pass is right (any layout error produces garbage).
 - GELU: `gpt.h` defaults to exact `erf` GELU (nanoGPT's `nn.GELU()`); the
   GPT-2 export sets the `tanh` approximation (`gelu_new`, what GPT-2 was trained
   with).
+- Dropout is not ported. nanoGPT's `model.py` has dropout (default `0.0` for
+  pretraining; the `shakespeare_char` config uses `0.2`), but this port always
+  runs with dropout `0` — every other training detail matches. At the toy scales
+  here it makes little difference; it's omitted to keep the fused attention and
+  activation buffers simple.
 - KV cache: generation caches per-layer keys/values (`GPT::forward_one`), so
   each new token is one O(1)-context step instead of recomputing the whole
   prefix — verified bit-identical to the full `forward()`. It applies within the

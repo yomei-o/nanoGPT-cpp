@@ -407,6 +407,23 @@ inline real softmax_crossentropy(real* dlogits, real* probs, const real* logits,
 }
 
 // ===========================================================================
+//  KV cache for fast autoregressive generation (inference only, batch 1).
+//  Stores the K and V projections of every past position, so each new token is
+//  a single O(1)-context forward step instead of recomputing the whole prefix.
+//  Valid up to block_size positions (learned absolute pos-emb can't slide).
+// ===========================================================================
+struct KVCache {
+    int L = 0, C = 0, maxT = 0, pos = 0;
+    std::vector<real> k, v;   // each laid out [L][maxT][C]
+    void init(const GPTConfig& c) {
+        L = c.n_layer; C = c.n_embd; maxT = c.block_size; pos = 0;
+        k.assign((size_t)L * maxT * C, (real)0);
+        v.assign((size_t)L * maxT * C, (real)0);
+    }
+    void reset() { pos = 0; }
+};
+
+// ===========================================================================
 //  The GPT model: owns parameters, gradients, activations, AdamW state.
 // ===========================================================================
 struct GPT {
@@ -549,6 +566,67 @@ struct GPT {
         } else {
             mean_loss = -1;
         }
+    }
+
+    // Incremental single-token forward using a KV cache (inference only, B=1).
+    // Appends `token`'s k/v at position kv.pos, attends over [0..kv.pos], writes
+    // logits (size V), and advances kv.pos. Numerically matches forward() run on
+    // the whole prefix (same ops, same order). Requires kv.pos < block_size.
+    void forward_one(int token, KVCache& kv, std::vector<real>& logits_out) {
+        int C = config.n_embd, L = config.n_layer, NH = config.n_head, V = config.vocab_size;
+        int hs = C / NH, pos = kv.pos;
+        real scale = (real)(1.0 / std::sqrt((double)hs));
+        std::vector<real> x(C), ln(C), qkv(3 * C), atty(C), tmp(C), fch(4 * C), fchg(4 * C);
+        real mean, rstd;
+        // token + (learned) position embedding
+        for (int c = 0; c < C; c++)
+            x[c] = params.wte[(size_t)token * C + c] + params.wpe[(size_t)pos * C + c];
+        for (int l = 0; l < L; l++) {
+            layernorm_forward(ln.data(), &mean, &rstd, x.data(), params.ln1w + (size_t)l * C,
+                              config.bias ? params.ln1b + (size_t)l * C : nullptr, 1, 1, C);
+            matmul_forward(qkv.data(), ln.data(), params.qkvw + (size_t)l * 3 * C * C,
+                           config.bias ? params.qkvb + (size_t)l * 3 * C : nullptr, 1, 1, C, 3 * C);
+            // append this position's k,v to the cache
+            real* kc = kv.k.data() + ((size_t)l * kv.maxT + pos) * C;
+            real* vc = kv.v.data() + ((size_t)l * kv.maxT + pos) * C;
+            for (int c = 0; c < C; c++) { kc[c] = qkv[C + c]; vc[c] = qkv[2 * C + c]; }
+            // causal attention over cached positions [0..pos], per head
+            for (int h = 0; h < NH; h++) {
+                const real* q = qkv.data() + h * hs;
+                std::vector<real> sc(pos + 1);
+                real maxv = -1e30f;
+                for (int t2 = 0; t2 <= pos; t2++) {
+                    const real* k = kv.k.data() + ((size_t)l * kv.maxT + t2) * C + h * hs;
+                    real dot = 0; for (int i = 0; i < hs; i++) dot += q[i] * k[i];
+                    dot *= scale; sc[t2] = dot; if (dot > maxv) maxv = dot;
+                }
+                real sum = 0; for (int t2 = 0; t2 <= pos; t2++) { real e = std::exp(sc[t2] - maxv); sc[t2] = e; sum += e; }
+                real inv = sum > 0 ? (real)1.0 / sum : (real)0;
+                real* o = atty.data() + h * hs;
+                for (int i = 0; i < hs; i++) o[i] = 0;
+                for (int t2 = 0; t2 <= pos; t2++) {
+                    const real* vv = kv.v.data() + ((size_t)l * kv.maxT + t2) * C + h * hs;
+                    real aw = sc[t2] * inv;
+                    for (int i = 0; i < hs; i++) o[i] += aw * vv[i];
+                }
+            }
+            matmul_forward(tmp.data(), atty.data(), params.attprojw + (size_t)l * C * C,
+                           config.bias ? params.attprojb + (size_t)l * C : nullptr, 1, 1, C, C);
+            for (int c = 0; c < C; c++) x[c] += tmp[c];              // residual
+            layernorm_forward(ln.data(), &mean, &rstd, x.data(), params.ln2w + (size_t)l * C,
+                              config.bias ? params.ln2b + (size_t)l * C : nullptr, 1, 1, C);
+            matmul_forward(fch.data(), ln.data(), params.fcw + (size_t)l * 4 * C * C,
+                           config.bias ? params.fcb + (size_t)l * 4 * C : nullptr, 1, 1, C, 4 * C);
+            gelu_forward(fchg.data(), fch.data(), 4 * C, config.gelu_tanh);
+            matmul_forward(tmp.data(), fchg.data(), params.fcprojw + (size_t)l * C * 4 * C,
+                           config.bias ? params.fcprojb + (size_t)l * C : nullptr, 1, 1, 4 * C, C);
+            for (int c = 0; c < C; c++) x[c] += tmp[c];              // residual
+        }
+        layernorm_forward(ln.data(), &mean, &rstd, x.data(), params.lnfw,
+                          config.bias ? params.lnfb : nullptr, 1, 1, C);
+        logits_out.assign(V, (real)0);
+        matmul_forward(logits_out.data(), ln.data(), params.wte, nullptr, 1, 1, C, V);  // tied lm_head
+        kv.pos++;
     }
 
     void zero_grad() {

@@ -147,6 +147,22 @@ static real eval_loss(GPT& m, const std::vector<int>& data, int B, int T,
     return (real)(sum / iters);
 }
 
+// sample one token id from raw logits with temperature + top-k (in-place scratch).
+static int sample_token(std::vector<real>& l, double temp, int topk, int V, std::mt19937& rng) {
+    std::uniform_real_distribution<double> uni(0.0, 1.0);
+    for (auto& x : l) x /= (temp > 0 ? (real)temp : (real)1);
+    if (topk > 0 && topk < V) {
+        std::vector<real> s(l); std::nth_element(s.begin(), s.end() - topk, s.end());
+        real th = s[s.size() - topk];
+        for (auto& x : l) if (x < th) x = (real)-1e30;
+    }
+    real mx = *std::max_element(l.begin(), l.end());
+    double sum = 0; for (auto& x : l) { x = (real)std::exp((double)(x - mx)); sum += x; }
+    double r = uni(rng) * sum, acc = 0; int next = V - 1;
+    for (int i = 0; i < V; i++) { acc += l[i]; if (acc >= r) { next = i; break; } }
+    return next;
+}
+
 // ---- generate (default subcommand) -----------------------------------------
 static int cmd_generate(int argc, char** argv) {
     std::string model = (argc > 1 && argv[1][0] != '-') ? argv[1] : "model_gpt2.bin";
@@ -170,9 +186,26 @@ static int cmd_generate(int argc, char** argv) {
 
     int V = m.config.vocab_size, bs = m.config.block_size;
     std::mt19937 rng(seed);
-    std::uniform_real_distribution<double> uni(0.0, 1.0);
     std::fputs(prompt.c_str(), stdout);
-    for (int step = 0; step < tokens; step++) {
+    auto emit = [&](int next) {
+        idx.push_back(next);
+        std::string piece = tok.decode({next});
+        std::fputs(piece.c_str(), stdout); std::fflush(stdout);
+    };
+    int produced = 0;
+    // KV-cache fast path while the sequence fits the context window
+    if ((int)idx.size() <= bs) {
+        KVCache kv; kv.init(m.config);
+        std::vector<real> logits;
+        for (size_t i = 0; i < idx.size() && kv.pos < bs; i++) m.forward_one(idx[i], kv, logits);
+        while (produced < tokens && kv.pos < bs) {
+            int next = sample_token(logits, temp, topk, V, rng);
+            emit(next); produced++;
+            if (kv.pos < bs && produced < tokens) m.forward_one(next, kv, logits);
+        }
+    }
+    // fallback: recompute-with-sliding beyond the context window
+    for (; produced < tokens; produced++) {
         int t = (int)idx.size();
         int start = std::max(0, t - bs);
         int tc = t - start;
@@ -180,20 +213,7 @@ static int cmd_generate(int argc, char** argv) {
         m.forward(cond.data(), nullptr, 1, tc);
         const real* logit = m.acts.logits + (size_t)(tc - 1) * V;
         std::vector<real> l(logit, logit + V);
-        for (auto& x : l) x /= (temp > 0 ? (real)temp : (real)1);
-        if (topk > 0 && topk < V) {
-            std::vector<real> s(l); std::nth_element(s.begin(), s.end() - topk, s.end());
-            real th = s[s.size() - topk];
-            for (auto& x : l) if (x < th) x = (real)-1e30;
-        }
-        real mx = *std::max_element(l.begin(), l.end());
-        double sum = 0; for (auto& x : l) { x = (real)std::exp((double)(x - mx)); sum += x; }
-        double r = uni(rng) * sum, acc = 0; int next = V - 1;
-        for (int i = 0; i < V; i++) { acc += l[i]; if (acc >= r) { next = i; break; } }
-        idx.push_back(next);
-        // stream the newly produced token
-        std::string piece = tok.decode({next});
-        std::fputs(piece.c_str(), stdout); std::fflush(stdout);
+        emit(sample_token(l, temp, topk, V, rng));
     }
     std::printf("\n");
     return 0;

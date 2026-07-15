@@ -176,8 +176,11 @@ way we want to live, to live ...
 ```
 
 `gpt2-medium`, `gpt2-large`, `gpt2-xl` work too (pass the name to the exporter).
-On CPU this is slow for the larger models (no KV cache, naive matmul); the point
-is portability, not speed. GPT-2 124M generates ~2 tokens/s on 4 CPU threads.
+On CPU this is slow for the larger models (naive matmul); the point is
+portability, not speed. Generation uses a **KV cache** within the context
+window — measured here about **5.5× faster** than recomputing the prefix each
+step (GPT-2 124M, 4 CPU threads: ~4.6 → ~26 tokens/s over a short generation;
+the gain grows with sequence length).
 
 ### Fine-tune GPT-2 on your own text
 
@@ -201,8 +204,8 @@ where it stopped (a plain `gpt2` generate ignores that trailing state).
 Speed (this machine, GPT-2 124M, 4 CPU threads, `batch 1`): about **6 s/step at
 `--block 128`** and **~14 s/step at `--block 256`**. So a ~200-step fine-tune is
 roughly **20 min** (`block 128`) to **45 min** (`block 256`); ~1000 steps is a
-few hours. It is CPU-only and un-optimised (no KV cache, naive matmul, no
-gradient accumulation) — meant as a working demo, not a fast trainer. Larger
+few hours. It is CPU-only and un-optimised (naive matmul, no gradient
+accumulation) — meant as a working demo, not a fast trainer. Larger
 models (`gpt2-medium`/`large`/`xl`) are proportionally slower.
 
 ---
@@ -268,8 +271,11 @@ layout and the forward pass is right (any layout error produces garbage).
 - GELU: `gpt.h` defaults to exact `erf` GELU (nanoGPT's `nn.GELU()`); the
   GPT-2 export sets the `tanh` approximation (`gelu_new`, what GPT-2 was trained
   with).
-- No KV cache: generation recomputes the whole context each step. Fine for a
-  demo; not optimised for throughput.
+- KV cache: generation caches per-layer keys/values (`GPT::forward_one`), so
+  each new token is one O(1)-context step instead of recomputing the whole
+  prefix — verified bit-identical to the full `forward()`. It applies within the
+  context window; once generation exceeds `block_size` it falls back to the
+  recompute-with-sliding path (learned absolute position embeddings can't slide).
 
 `input.txt`, `encoder.json` and `vocab.bpe` are included for convenience; you
 may prefer to `.gitignore` them and let users fetch them via the commands above.

@@ -113,11 +113,43 @@ static bool load_checkpoint(const std::string& path, GPT& m, CharTokenizer& tok,
 }
 
 // ---- text generation -------------------------------------------------------
+// sample one token id from raw logits with temperature + top-k (in-place scratch).
+static int sample_token(std::vector<real>& l, real temperature, int top_k, int V,
+                        std::mt19937& rng) {
+    std::uniform_real_distribution<double> uni(0.0, 1.0);
+    for (auto& x : l) x /= (temperature > 0 ? temperature : (real)1);
+    if (top_k > 0 && top_k < V) {
+        std::vector<real> s(l); std::nth_element(s.begin(), s.end() - top_k, s.end());
+        real thresh = s[s.size() - top_k];
+        for (auto& x : l) if (x < thresh) x = (real)-1e30;
+    }
+    real mx = *std::max_element(l.begin(), l.end());
+    double sum = 0; for (auto& x : l) { x = (real)std::exp((double)(x - mx)); sum += x; }
+    double r = uni(rng) * sum, acc = 0; int next = V - 1;
+    for (int i = 0; i < V; i++) { acc += l[i]; if (acc >= r) { next = i; break; } }
+    return next;
+}
+
+// Autoregressive generation. Uses the KV cache while the sequence fits in the
+// context window (fast: one O(1) step per token); falls back to the recompute-
+// with-sliding path once it exceeds block_size (learned pos-emb can't slide).
 static std::vector<int> generate(GPT& m, std::vector<int> idx, int max_new,
                                  real temperature, int top_k, std::mt19937& rng) {
     int V = m.config.vocab_size, bs = m.config.block_size;
-    std::uniform_real_distribution<double> uni(0.0, 1.0);
-    for (int step = 0; step < max_new; step++) {
+    int produced = 0;
+    if ((int)idx.size() <= bs) {
+        KVCache kv; kv.init(m.config);
+        std::vector<real> logits;
+        // prime the cache with the prompt (last bs tokens fit by construction)
+        for (size_t i = 0; i < idx.size() && kv.pos < bs; i++) m.forward_one(idx[i], kv, logits);
+        while (produced < max_new && kv.pos < bs) {
+            int next = sample_token(logits, temperature, top_k, V, rng);
+            idx.push_back(next); produced++;
+            if (kv.pos < bs && produced < max_new) m.forward_one(next, kv, logits);
+        }
+    }
+    // fallback for anything beyond the context window
+    for (; produced < max_new; produced++) {
         int t = (int)idx.size();
         int start = std::max(0, t - bs);
         int tc = t - start;
@@ -125,17 +157,7 @@ static std::vector<int> generate(GPT& m, std::vector<int> idx, int max_new,
         m.forward(cond.data(), nullptr, 1, tc);
         const real* logit = m.acts.logits + (size_t)(tc - 1) * V;   // last position
         std::vector<real> l(logit, logit + V);
-        for (auto& x : l) x /= (temperature > 0 ? temperature : (real)1);
-        if (top_k > 0 && top_k < V) {
-            std::vector<real> s(l); std::nth_element(s.begin(), s.end() - top_k, s.end());
-            real thresh = s[s.size() - top_k];
-            for (auto& x : l) if (x < thresh) x = (real)-1e30;
-        }
-        real mx = *std::max_element(l.begin(), l.end());
-        double sum = 0; for (auto& x : l) { x = (real)std::exp((double)(x - mx)); sum += x; }
-        double r = uni(rng) * sum, acc = 0; int next = V - 1;
-        for (int i = 0; i < V; i++) { acc += l[i]; if (acc >= r) { next = i; break; } }
-        idx.push_back(next);
+        idx.push_back(sample_token(l, temperature, top_k, V, rng));
     }
     return idx;
 }
